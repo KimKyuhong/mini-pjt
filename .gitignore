@@ -1,0 +1,6 @@
+# .gitignore
+.venv/
+.env
+__pycache__/
+docs/
+data/runtime/.ouroboros/artifacts/
