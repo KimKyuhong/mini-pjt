@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "ouroboros": {
+      "command": "C:\\Users\\Admin\\AppData\\Roaming\\Python\\Python314\\Scripts\\uvx.exe",
+      "args": [
+        "--isolated",
+        "--python",
+        ">=3.12",
+        "--from",
+        "ouroboros-ai[mcp]==0.59.9",
+        "ouroboros",
+        "mcp",
+        "serve",
+        "--runtime",
+        "claude-cli",
+        "--llm-backend",
+        "claude_code"
+      ]
+    }
+  }
+}
