@@ -63,6 +63,7 @@ class ScriptedChatModel(BaseChatModel):
 
     responses: list
     calls: int = 0  # 지금까지 호출된 횟수 (테스트에서 "LLM 을 몇 번 불렀는지" 확인할 때도 쓴다)
+    seen: list = []  # 호출마다 받은 메시지 목록 (모델에 무엇이 전달됐는지 확인할 때 쓴다. pydantic 이 인스턴스마다 새 리스트로 복사한다)
 
     # @property: 메서드를 필드처럼 읽게 만든다 (Java 의 getter 를 model.llmType 처럼 부르는 것과 같다)
     @property
@@ -82,9 +83,12 @@ class ScriptedChatModel(BaseChatModel):
         # min(...) 으로 인덱스가 목록 끝을 넘지 않게 한다 → 다 쓰면 마지막 응답 반복
         response = self.responses[min(self.calls, len(self.responses) - 1)]
         self.calls += 1  # Python 에는 ++ 연산자가 없다
+        self.seen.append(messages)
         if isinstance(response, Exception):
             raise response
-        return ChatResult(generations=[ChatGeneration(message=response)])
+        # 같은 응답 객체를 다시 쓰면 메시지 id 가 같아서, 대화 기록에 새로 붙지 않고 앞 메시지를 덮어쓴다(실제 모델은 매번 새 id).
+        # 그래서 id 를 비운 복사본을 돌려준다 (Java 의 clone() 후 id = null). 비운 id 는 LangChain 이 새로 채운다.
+        return ChatResult(generations=[ChatGeneration(message=response.model_copy(update={"id": None}))])
 
 
 def tool_call(name: str, args: dict, call_id: str = "call-1") -> AIMessage:

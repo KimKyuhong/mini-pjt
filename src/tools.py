@@ -121,10 +121,15 @@ def validate_request(fields: dict) -> list[str]:
             errors.append("방문일시를 이해하지 못했습니다. 예: 2026년 11월 17일 오전 10시")
         else:  # try 블록에서 예외가 나지 않았을 때만 실행된다
             today = reference_date()
+            # 신청 가능한 가장 빠른 방문일: 기준일 다음 날부터 첫 평일 (과거·당일 거절 시 함께 안내한다)
+            earliest = today + timedelta(days=1)
+            while earliest.weekday() >= 5:  # 토·일이면 하루씩 미룬다
+                earliest += timedelta(days=1)
+            earliest_text = f"가장 빠른 신청 가능 방문일은 {earliest:%Y-%m-%d} ({WEEKDAYS[earliest.weekday()]})입니다."
             if visit < today:
-                errors.append("이미 지난 날짜로는 신청할 수 없습니다.")
+                errors.append(f"이미 지난 날짜로는 신청할 수 없습니다. {earliest_text}")
             elif visit == today:
-                errors.append("방문 당일 신청은 받지 않습니다. 방문일 최소 1일 전까지 신청해 주세요.")
+                errors.append(f"방문 당일 신청은 받지 않습니다. 방문일 최소 1일 전까지 신청해 주세요. {earliest_text}")
             if visit.weekday() >= 5:  # 5=토요일, 6=일요일
                 errors.append(f"주말({WEEKDAYS[visit.weekday()]}요일) 방문은 받지 않습니다. 평일로 다시 정해 주세요.")
     if fields.get("host") and find_employee(fields["host"]) is None:
@@ -228,9 +233,8 @@ def create_visit_request(runtime: ToolRuntime) -> Command | str:
     """
     # runtime 인자는 LLM 이 넘기는 값이 아니다. LangChain 이 실행 시 자동으로 넣어 주며, LLM 에게 보이는 도구 스키마에서도 빠진다.
     state = runtime.state
-    if state.get("status") == "submitted" and state.get("request_id"):
-        # 이미 접수된 대화에서 다시 신청하려는 경우: 저장하지 않고 같은 신청번호를 안내한다(중복 저장 방지는 4단계에서 보강)
-        return f"이미 접수된 신청입니다. 신청번호는 {state['request_id']} 입니다."
+    # 접수(확정) 뒤에는 신청 항목을 비워 두므로, 같은 대화의 새 신청은 처음부터 다시 모은 값으로 검증·확인을 거친다.
+    # (같은 신청이 두 번 저장되지 않는 것은 항목 비우기 + '확정' 이 있어야만 저장하는 규칙으로 보장된다)
     fields = _state_fields(state)
     errors = validate_request(fields)
     if errors:
@@ -240,15 +244,21 @@ def create_visit_request(runtime: ToolRuntime) -> Command | str:
     # interrupt(값): 그래프를 여기서 멈추고 '값' 을 바깥(API)에 넘긴다. 사용자가 답하면 Command(resume=답) 으로 재개되고,
     # interrupt(...) 호출이 그 답을 반환한다. (재개 시 이 함수는 처음부터 다시 실행되지만, 이미 답이 있는 interrupt 는 즉시 그 답을 돌려준다)
     # 원본 필드 값은 서버 메모리(state)에만 있고, 화면에 보일 때는 agent.py 가 마스킹한다.
-    reply = interrupt({"fields": fields, "retry": False})
-    # '확정'·'취소' 가 아니면 다시 묻는다 (CLAUDE.md: 그 밖의 입력은 확정/취소를 다시 묻는다)
-    while normalize_reply(reply) not in ("확정", "취소"):
-        reply = interrupt({"fields": fields, "retry": True})
-
-    if normalize_reply(reply) == "취소":
+    reply = interrupt({"fields": fields})
+    answer = normalize_reply(reply)
+    if answer not in ("확정", "취소"):
+        # '확정'·'취소' 가 아닌 답(수정·차량번호 추가·질문 등): 저장하지 않고 확인 단계를 닫는다.
+        # agent.answer() 가 이어서 같은 입력을 새 사용자 메시지로 넣어, 추출·가드레일을 거쳐 바뀐 값으로 요약을 다시 보여 준다.
+        # editing=True 는 그 턴의 LLM 에게 "요약을 다시 보여 주라" 는 표시다(CLAUDE.md: 저장은 '확정' 일 때만).
+        note = "사용자가 확인 요약을 보고 '확정'·'취소' 대신 수정 또는 질문을 보냈다. 저장하지 않았다."
+        return Command(
+            update={"editing": True, "messages": [ToolMessage(note, tool_call_id=runtime.tool_call_id)]}
+        )
+    if answer == "취소":
         return Command(
             update={
                 "status": "cancelled",
+                "editing": False,
                 "messages": [ToolMessage("방문 신청을 취소했습니다. 저장된 내용은 없습니다.", tool_call_id=runtime.tool_call_id)],
             }
         )
@@ -262,6 +272,12 @@ def create_visit_request(runtime: ToolRuntime) -> Command | str:
         update={
             "status": "submitted",
             "request_id": request_id,
+            "editing": False,
+            # 저장한 신청 항목은 state 에서 비운다. 원본은 저장소에 있고, 다음 신청은 처음부터 새로 모은다.
+            # 딕셔너리 컴프리헨션으로 {필드: None, ...} 을 만들고 ** 로 풀어 넣는다
+            **{key: None for key in FIELD_LABELS},
+            "visit_date_part": None,
+            "visit_time_part": None,
             "messages": [ToolMessage(message, tool_call_id=runtime.tool_call_id)],
         }
     )

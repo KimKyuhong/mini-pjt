@@ -88,27 +88,46 @@ def test_취소하면_저장하지_않는다(use_model, isolated_store):
     assert _stored(isolated_store) == []
 
 
-def test_확정_취소가_아닌_입력은_다시_묻는다(use_model, isolated_store):
-    """확정 대기 중 '응' 같은 다른 입력은 다시 묻고(저장 0건), 그 뒤 '확정' 하면 저장된다."""
+def test_확정_취소가_아닌_입력이면_저장_없이_요약을_다시_보여준다(use_model, isolated_store):
+    """확정 대기 중 '응' 같은 다른 입력은 일반 턴으로 처리해 요약을 다시 보여 주고(저장 0건), 그 뒤 '확정' 하면 저장된다."""
     use_model(APPLY, form=FORM)
     first = _post("방문 신청합니다")
     again = _post("응 그렇게 해줘", first["thread_id"])
     assert again["status"] == "pending_confirmation"
-    assert again["answer"].startswith("'확정' 또는 '취소' 로만 답해 주세요")
+    assert again["answer"].startswith("아래 내용으로 방문을 신청할까요?")
+    assert again["trace"][0]["step"] == "확정 대기 응답"  # 확인 단계를 닫고 다시 시작한 기록
     assert _stored(isolated_store) == []
     done = _post("확정", first["thread_id"])
     assert done["status"] == "submitted"
     assert len(_stored(isolated_store)) == 1
 
 
-def test_접수된_대화에서_LLM_이_다시_신청하려_해도_저장하지_않는다(use_model, isolated_store):
-    """submitted 이후 LLM 이 create_visit_request 를 다시 부르면 도구가 같은 신청번호를 안내하고 저장 건수는 그대로다."""
+def test_접수된_대화의_새_신청은_처음부터_검증_확인을_거치고_확정_전에는_저장하지_않는다(use_model, isolated_store):
+    """접수 뒤 같은 대화에서 새 신청 정보를 보내면 이전 신청번호를 안내하지 않고 새 확인 단계로 간다. 저장은 여전히 1건."""
     use_model(APPLY + [tool_call("create_visit_request", {}, "call-2")], form=FORM)
     first = _post("방문 신청합니다")
     _post("확정", first["thread_id"])
     body = _post("같은 내용으로 한 번 더 신청해 주세요", first["thread_id"])
-    assert "GM-20261112-0001" in body["answer"]
-    assert body["status"] == "submitted"
+    assert body["status"] == "pending_confirmation"
+    assert "GM-20261112-0001" not in body["answer"]
+    assert len(_stored(isolated_store)) == 1  # '확정' 전이므로 새 저장 없음
+
+
+def test_접수된_대화에서_LLM_이_항목_없이_다시_신청을_부르면_저장하지_않는다(fake_index, isolated_store):
+    """접수 뒤 항목은 비워지므로, 새 정보 없이 LLM 이 create_visit_request 를 다시 불러도 '정보가 더 필요' 안내만 나온다."""
+    from src import agent
+    from tests.conftest import ScriptedChatModel, guard_model
+
+    extractor = ScriptedChatModel(responses=[tool_call("VisitForm", FORM), tool_call("VisitForm", {})])
+    model = ScriptedChatModel(responses=APPLY + [tool_call("create_visit_request", {}, "call-2")])
+    agent.set_agent(agent.build_agent(model, guard_models=[guard_model()], extract_models=[extractor]))
+    try:
+        first = _post("방문 신청합니다")
+        _post("확정", first["thread_id"])
+        body = _post("한 번 더 저장해 주세요", first["thread_id"])
+    finally:
+        agent.set_agent(None)
+    assert body["answer"].startswith("방문 신청을 진행할 수 없습니다.\n- 다음 정보가 더 필요합니다")
     assert len(_stored(isolated_store)) == 1
 
 
@@ -224,6 +243,13 @@ def test_주말_과거_당일_방문은_거부한다():
     assert any("당일" in e for e in _validate(visit_datetime="2026-11-12T15:00"))
 
 
+def test_과거_당일_거절에는_가장_빠른_신청_가능일을_함께_안내한다(monkeypatch):
+    """round2 개선(시나리오 13): 기준일 다음 첫 평일을 알려 준다. 목요일 기준 → 금요일, 금요일 기준 → 다음 주 월요일."""
+    assert any("2026-11-13 (금)" in e for e in _validate(visit_datetime="2026-11-12T15:00"))
+    monkeypatch.setenv("VISIT_REFERENCE_DATE", "2026-11-13")  # 금요일 기준: 토·일을 건너뛴다
+    assert any("2026-11-16 (월)" in e for e in _validate(visit_datetime="2026-11-10T10:00"))
+
+
 def test_휴대폰번호_형식과_없는_피방문자는_거부한다():
     """시나리오 14(010-123-45), 10(최가상)."""
     assert any("휴대폰번호 형식" in e for e in _validate(phone="010-123-45"))
@@ -266,3 +292,124 @@ def test_신청번호는_같은_날짜_안에서_일련번호로_늘어난다(is
     """같은 기준일에 두 번 저장하면 0001, 0002 순서로 발급된다."""
     assert tools.save_request(FORM) == "GM-20261112-0001"
     assert tools.save_request(FORM) == "GM-20261112-0002"
+
+
+# ── 나눠 말하기: 직전 질문에 짧게 답하는 흐름 ─────────────────────────
+
+
+def test_추출기는_직전_질문과_이미_모인_항목을_함께_받는다(fake_index):
+    """'정민호' 같은 짧은 답은 직전 질문(피방문자 성함)을 알아야 host 로 넣을 수 있다. 추출기 입력에 둘 다 들어가는지 본다."""
+    from langchain_core.messages import AIMessage
+
+    from src import agent
+    from tests.conftest import ScriptedChatModel, guard_model
+
+    extractor = ScriptedChatModel(
+        responses=[tool_call("VisitForm", {"visitor_name": "홍길동"}), tool_call("VisitForm", {"host": "정민호"})]
+    )
+    model = ScriptedChatModel(responses=[AIMessage("방문하실 임직원(피방문자) 성함을 알려주세요."), AIMessage("확인했습니다.")])
+    agent.set_agent(agent.build_agent(model, guard_models=[guard_model()], extract_models=[extractor]))
+    try:
+        thread_id = _post("방문 신청할게요. 저는 홍길동입니다.")["thread_id"]
+        _post("정민호", thread_id)
+    finally:
+        agent.set_agent(None)
+    second = str(extractor.seen[1])  # 두 번째 턴에 추출기가 받은 프롬프트 전체
+    assert "[어시스턴트의 직전 질문] 방문하실 임직원(피방문자) 성함을 알려주세요." in second
+    assert "[사용자 메시지] 정민호" in second
+    assert "이미 모인 항목: 방문자" in second
+    # 두 번째 턴의 에이전트 모델은 '모인 항목에 없는 값은 받았다고 말하지 말라' 는 진행 상황 메모를 받는다
+    assert "받았다고 말하지 말고 다시 묻는다" in str(model.seen[1])
+    # 입력 예시용 날짜는 기준일(2026-11-12 목) 다음 평일로 안내한다 (지난 날짜 예시 방지)
+    assert "11월 13일 오후 2시" in str(model.seen[1])
+
+
+def test_나눠_받은_날짜와_시각을_합친다():
+    """날짜만 → 반쪽 보관, 이어서 시각 → visit_datetime 완성. 이미 있는 일시는 바꾼 쪽만 갈아 끼운다."""
+    from src.agent import _merge_datetime
+
+    assert _merge_datetime({}, "2026-11-17", None) == {"visit_date_part": "2026-11-17", "visit_time_part": None}
+    assert _merge_datetime({"visit_date_part": "2026-11-17"}, None, "14:00") == {
+        "visit_datetime": "2026-11-17T14:00",
+        "visit_date_part": None,
+        "visit_time_part": None,
+    }
+    assert _merge_datetime({"visit_time_part": "14:00"}, "2026-11-18", None)["visit_datetime"] == "2026-11-18T14:00"
+    assert _merge_datetime({"visit_datetime": "2026-11-17T10:00"}, None, "15:00")["visit_datetime"] == "2026-11-17T15:00"
+
+
+# ── 확정 대기 중 수정: 바꿀 내용·차량번호 추가·질문 ──────────────────
+
+
+def _edit_agent(forms: list[dict], responses: list):
+    """턴마다 다른 추출 결과(forms)와 에이전트 응답(responses)을 쓰는 가짜 에이전트를 끼운다. 에이전트 모델을 돌려준다."""
+    from src import agent
+    from tests.conftest import ScriptedChatModel, guard_model
+
+    extractor = ScriptedChatModel(responses=[tool_call("VisitForm", f) for f in forms])
+    model = ScriptedChatModel(responses=responses)
+    agent.set_agent(agent.build_agent(model, guard_models=[guard_model()], extract_models=[extractor]))
+    return model
+
+
+def test_확정_대기_중_차량번호를_추가하면_바뀐_요약을_보여주고_확정하면_그_값으로_저장한다(fake_index, isolated_store):
+    from src import agent
+
+    _edit_agent([FORM, {"vehicle_number": "12가3456"}], APPLY)
+    try:
+        first = _post("방문 신청합니다")
+        assert "차량번호: 없음" in first["answer"]
+        edited = _post("차량번호 12가3456 추가해 주세요", first["thread_id"])
+        assert edited["status"] == "pending_confirmation"
+        assert "차량번호: 12가****" in edited["answer"]  # 바뀐 값이 마스킹되어 요약에 나온다
+        assert _stored(isolated_store) == []  # 수정만으로는 저장하지 않는다
+        done = _post("확정", first["thread_id"])
+    finally:
+        agent.set_agent(None)
+    assert done["status"] == "submitted"
+    [stored] = _stored(isolated_store)
+    assert stored["vehicle_number"] == "12가3456"
+
+
+def test_확정_대기_중_차량번호를_빼_달라고_하면_없음으로_바뀐다(fake_index, isolated_store):
+    from src import agent
+
+    _edit_agent([{**FORM, "vehicle_number": "12가3456"}, {"clear_vehicle": True}], APPLY)
+    try:
+        first = _post("방문 신청합니다")
+        edited = _post("차는 안 가져가요. 차량번호 빼 주세요", first["thread_id"])
+    finally:
+        agent.set_agent(None)
+    assert "차량번호: 12가****" in first["answer"]
+    assert "차량번호: 없음" in edited["answer"]
+
+
+def test_확정_대기_중_질문하면_답과_함께_요약을_다시_보여준다(fake_index, isolated_store):
+    """질문 턴의 LLM 답변이 요약 안내문 앞에 붙고, 상태는 다시 확정 대기, 저장은 0건이다."""
+    from langchain_core.messages import AIMessage
+
+    from src import agent
+
+    answer_and_apply = AIMessage(
+        content="방문객 주차장은 정문 옆입니다.",
+        tool_calls=[{"name": "create_visit_request", "args": {}, "id": "call-2", "type": "tool_call"}],
+    )
+    _edit_agent([FORM, {}], [APPLY[0], answer_and_apply])
+    try:
+        first = _post("방문 신청합니다")
+        edited = _post("주차는 어디에 해요?", first["thread_id"])
+    finally:
+        agent.set_agent(None)
+    assert edited["status"] == "pending_confirmation"
+    assert edited["answer"].startswith("방문객 주차장은 정문 옆입니다. 아래 내용으로 방문을 신청할까요?")
+    assert _stored(isolated_store) == []
+
+
+def test_확정_대기_중_주민등록번호를_보내면_가드레일이_막고_저장하지_않는다(use_model, isolated_store):
+    """수정 턴도 일반 턴이라 입력 가드레일을 거친다. 고유식별정보는 차단 문구로 답하고 저장 0건."""
+    use_model(APPLY, form=FORM)
+    first = _post("방문 신청합니다")
+    blocked = _post("주민등록번호 900101-1234567 도 넣어 주세요", first["thread_id"])
+    assert blocked["answer"].startswith("주민등록번호, 여권번호, 카드번호 같은 고유식별·금융정보는")
+    assert "900101-1234567" not in str(blocked)
+    assert _stored(isolated_store) == []

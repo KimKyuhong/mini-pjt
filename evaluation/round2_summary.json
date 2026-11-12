@@ -1,0 +1,14 @@
+{
+  "total": 20,
+  "passed": 20,
+  "guardrail_violations": 0,
+  "faithfulness": 0.92,
+  "answer_relevancy": 0.7,
+  "ragas_case_ids": [
+    "1",
+    "2",
+    "3",
+    "4",
+    "5"
+  ]
+}

@@ -99,6 +99,8 @@ body { word-break: keep-all; display: grid; grid-template-columns: minmax(0, 5fr
 .pass { max-width: 32rem; padding: var(--space-xs); border-radius: var(--radius-card); background: var(--glass); -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.35); backdrop-filter: blur(var(--glass-blur)) saturate(1.35); box-shadow: var(--glass-hi), var(--shadow-card); }
 .pass__head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-md); padding: var(--space-md) var(--space-md) var(--space-sm); }
 .pass__head h2 { font-size: var(--text-lg); font-weight: 500; }
+.pass__edit { display: flex; flex-wrap: wrap; gap: var(--space-xs); padding: 0 var(--space-md) var(--space-sm); }
+.pass__edit .btn { min-height: 34px; padding: 0 var(--space-md); }
 .pass__head p { font-size: var(--text-sm); color: var(--color-muted); }
 .pass dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); margin: 0; padding: 0 var(--space-md) var(--space-sm); }
 .pass dt, .pass dd { padding-block: var(--space-xs); border-top: var(--rule-hair) solid color-mix(in oklab, var(--color-light) 7%, transparent); }

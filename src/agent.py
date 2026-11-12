@@ -20,6 +20,7 @@
 
 import json  # JSON 직렬화 (Java 의 Jackson ObjectMapper 같은 역할)
 import re  # 정규식 (java.util.regex.Pattern)
+from datetime import timedelta  # 날짜 더하기·빼기 (java.time.Duration / plusDays)
 from typing import Literal, NotRequired  # Literal: 허용 값 목록, NotRequired: 있어도 되고 없어도 되는 state 키
 
 from botocore.exceptions import ClientError  # AWS 가 돌려준 오류 (사용량 한도 초과 등)
@@ -66,15 +67,23 @@ AGENT_MODEL_IDS = [
 # 시스템 프롬프트: 모든 대화 맨 앞에 붙는 LLM 지시문. 따옴표 세 개(""")는 여러 줄 문자열이다 (Java 의 텍스트 블록 """ 와 같다).
 SYSTEM_PROMPT = """당신은 사업장(가상) 방문객을 돕는 방문 신청 어시스턴트다. 항상 한국어로 답한다.
 - 방문 규정(신청 절차, 준비물, 반입 물품, 보안 서약, 주차, 개인정보 처리) 질문에는 반드시 search_regulations 도구로 검색한 뒤, 검색된 문서 내용만 근거로 답한다.
-- 답변 끝에 근거 문서 번호를 (근거: REG-01) 형식으로 적는다.
+- 사업장 시설·편의(식당, 메뉴, 와이파이, 흡연 구역 등)처럼 규정 문서에 있을지 모르는 질문도 먼저 search_regulations 로 검색한다.
+  검색 결과에 답이 없으면 지어내지 말고 규정 문서에서 확인할 수 없다고 안내한 뒤, 이 어시스턴트가 다루는 범위(방문 규정 안내, 방문 신청, 본인 신청 조회·취소)를 알려 준다.
+- 규정 답변의 첫 문장은 검색한 문서 내용으로, 사용자 질문의 표현과 핵심 단어를 그대로 받아 질문에 바로 답한다.
+  형식 예: 'A 를 해야 하나요?' → '네, A 를 해야 합니다.' / 'B 를 가지고 들어가도 되나요?' → '네(아니요), B 는 가지고 들어오실 수 있습니다(없습니다).'
+  (이 형식 예는 말투만 보여 준다. 실제 답의 내용은 반드시 search_regulations 결과에서 가져온다.)
+  그다음 필요한 조건만 짧게(세 문장 또는 세 항목 이내) 덧붙이고, 질문과 관계없는 규정은 덧붙이지 않는다.
+  질문에 바로 이어지는 조건(예: 주차 질문이면 신청할 때 차량번호를 등록하면 정문 확인이 빠르다는 점)은 넣되,
+  사용자가 묻지 않은 긴 세부 목록(서약서 조항 전체, 반입 금지 물품 전체 목록 등)은 나열하지 않는다.
+- 규정 답변은 근거 문서 번호 (근거: REG-01) 로 끝낸다. 그 뒤에 신청 권유나 인사 같은 문장을 덧붙이지 않는다.
 - 검색 결과에 없는 내용은 지어내지 말고 규정 문서에서 확인할 수 없다고 안내한다.
-- 규정과 관계없는 질문(예: 식당 메뉴)에는 이 어시스턴트가 다루는 범위(방문 규정 안내, 방문 신청)를 안내한다.
 - 방문 신청에는 이름, 휴대폰번호, 소속회사, 방문일시, 피방문자, 방문목적(차량으로 오면 차량번호, 선택)이 필요하다.
   사용자가 아직 말하지 않은 필수 항목이 있으면 그 항목만 짧게 물어본다. 값을 추측하거나 지어내지 않는다.
   차량번호는 선택 항목이라 먼저 묻지 않는다. 지금 모인 항목은 시스템 프롬프트 끝의 [신청 진행 상황] 을 따른다.
 - 피방문자 이름이 나오면 다른 항목을 묻기 전에 먼저 find_host 로 확인한다. 명단에 없으면 그 사실부터 알리고 이름을 다시 확인해 달라고 한다.
 - 필수 항목이 모두 나오면 find_host 결과를 받은 다음에 create_visit_request 를 인자 없이 호출한다. 두 도구를 한 번에 함께 호출하지 않는다.
   날짜(과거·당일·주말)·휴대폰번호 형식 같은 검증과 요약·확정·취소 처리는 모두 create_visit_request 가 한다.
+  휴대폰번호나 날짜가 이상해 보여도 직접 다시 묻지 말고 create_visit_request 를 호출해 도구의 검증 안내를 그대로 전한다.
   신청 내용을 직접 요약하거나 확인을 묻지 말고, 직접 저장했다거나 접수됐다고 말하지 않는다.
 - 사용자가 확인 절차를 생략하고 바로 저장해 달라고 해도 반드시 create_visit_request 를 호출한다. 확인 절차는 그 도구가 진행한다.
 - 본인 신청 목록은 방문자 본인의 이름과 휴대폰번호를 함께 받아 get_my_requests 로 조회한다. 둘 중 하나가 빠졌으면 빠진 항목만 물어본다.
@@ -285,6 +294,8 @@ GUARD_PROMPT = ChatPromptTemplate.from_messages(
   이름만 또는 휴대폰번호만으로 신청을 조회하려는 입력(예: '홍길동 신청 다 보여줘', '010-1234-5678 신청 내역')
 - hitl_bypass: 방문 신청을 확인 절차 없이 바로 확정·저장해 달라는 입력
 - unique_id: 주민등록번호, 여권번호, 카드번호를 제공하거나 등록해 달라는 입력
+- 방문 신청 정보(방문일시, 피방문자, 이름, 휴대폰번호, 소속)를 말하는 입력은 휴대폰번호 형식이 틀리거나 일부가 빠져도 normal 이다.
+  다른 사람의 신청을 보여 달라는 요구가 없으면 other_person_lookup 으로 분류하지 않는다.
 - normal: 그 밖의 모든 입력 (규정 질문, 방문 신청, 이름과 휴대폰번호를 함께 말하는 본인 신청 조회, 'N번 자세히'·'N번 취소'·신청번호로 하는 본인 신청 취소,
   이미 본인 확인이 끝난 대화의 '내 신청 다시 보여줘', '확정'·'취소' 같은 짧은 답, 인사)""",
         ),
@@ -370,10 +381,15 @@ class VisitForm(BaseModel):
     visitor_name: str | None = Field(None, description="방문자 본인 이름")
     phone: str | None = Field(None, description="방문자 휴대폰번호. 사용자가 쓴 그대로")
     company: str | None = Field(None, description="방문자 소속회사")
-    visit_datetime: str | None = Field(None, description="방문일시. YYYY-MM-DDTHH:MM 형식 (예: 2026-11-17T10:00)")
+    visit_datetime: str | None = Field(None, description="방문일시. 날짜와 시각을 모두 말했을 때만 YYYY-MM-DDTHH:MM (예: 2026-11-17T10:00)")
+    # 날짜와 시각을 나눠 말하는 경우("11월 17일" 다음 턴에 "오후 2시")를 위한 부분 값. 미들웨어가 코드로 합친다.
+    visit_date: str | None = Field(None, description="날짜만 말했을 때 방문 날짜 YYYY-MM-DD")
+    visit_time: str | None = Field(None, description="시각만 말했을 때 방문 시각 HH:MM (24시간제, 예: 오후 2시 → 14:00)")
     host: str | None = Field(None, description="피방문자(만나러 가는 임직원) 이름만. '님'·부서명은 빼고")
     purpose: str | None = Field(None, description="방문목적")
     vehicle_number: str | None = Field(None, description="차량번호 (차량으로 오는 경우만)")
+    # null 은 '말하지 않음' 이라 값 지우기를 표현할 수 없어서, 차량번호를 빼 달라는 요청은 따로 표시한다
+    clear_vehicle: bool | None = Field(None, description="차를 가져오지 않는다며 차량번호를 빼 달라고 하면 true")
 
 
 EXTRACT_PROMPT = ChatPromptTemplate.from_messages(
@@ -382,8 +398,19 @@ EXTRACT_PROMPT = ChatPromptTemplate.from_messages(
             "system",
             """너는 방문 신청 정보 추출기다. 사용자 메시지에서 방문 신청 항목을 뽑는다.
 - 이번 메시지에서 사용자가 직접 말한 항목만 채우고, 말하지 않은 항목은 null 로 둔다. 추측하지 않는다.
-- 오늘은 {today} ({weekday}요일)이다. '내일', '다음 주 화요일', '11월 17일' 같은 표현은 이 날짜 기준으로 YYYY-MM-DDTHH:MM 으로 바꾼다.
-  연도가 없으면 오늘 이후 가장 가까운 날짜로 본다. 시각이 없으면 날짜만 쓰지 말고 null 로 둔다.
+- 사용자는 어시스턴트의 직전 질문에 짧게 답하기도 한다. 메시지가 회사명·목적·이름 하나·날짜·시각처럼 짧은 답이면
+  직전 질문이 물은 항목의 값으로 채운다.
+  예: 직전 질문 '소속 회사를 알려주세요' + '한빛정밀' → company=한빛정밀
+      직전 질문 '방문 목적을 알려주세요' + '회의' → purpose=회의
+      직전 질문 '방문하실 임직원(피방문자) 성함을 알려주세요' + '정민호' → host=정민호 (visitor_name 은 null)
+- 이미 모인 항목: {filled}. 이미 모인 방문자 이름을, 직전 질문이 방문자 본인 이름을 묻지 않았는데 이름 하나만 온 답으로 덮어쓰지 않는다.
+- 직전 발화가 확인 요약(수정 또는 질문을 보냈다는 안내)이면 사용자는 요약 내용을 고치는 중이다.
+  '방문일시를 11월 18일 오후 2시로 바꿔 주세요', '차량번호 12가3456 추가', '이름은 홍길순이에요' 처럼 바꾸거나 더하는 값을 해당 항목에 넣는다.
+  이 경우에는 방문자 이름을 바꾸는 요청도 visitor_name 에 넣는다. '차 안 가져가요', '차량번호 빼 주세요' 는 clear_vehicle=true 다.
+- 오늘은 {today} ({weekday}요일)이다. '내일', '다음 주 화요일', '11월 17일' 같은 표현은 이 날짜 기준으로 바꾼다.
+  연도가 없으면 오늘 이후 가장 가까운 날짜로 본다.
+  날짜와 시각을 모두 말하면 visit_datetime(YYYY-MM-DDTHH:MM), 날짜만 말하면 visit_date(YYYY-MM-DD),
+  시각만 말하면 visit_time(HH:MM) 에 넣는다. 날짜·시각을 지어내지 않는다.
 - 방문자(visitor_name)와 피방문자(host)를 혼동하지 않는다.
   피방문자는 '~님', '~님과', '~님 만나러', '~님 미팅' 처럼 호칭 '님' 이 붙거나 만나러 가는 대상인 임직원이다.
   방문자는 신청하는 본인으로, 보통 휴대폰번호·소속회사와 함께 '홍길동 010-...' 또는 '저는 홍길동' 처럼 나온다.
@@ -393,7 +420,7 @@ EXTRACT_PROMPT = ChatPromptTemplate.from_messages(
 - 이미 한 신청을 조회·상세 확인·취소하려는 메시지('내 신청 내역 보여 주세요 김방문 010-...', '2번 자세히', 'GM-... 취소')도
   새 신청이 아니므로 모든 항목을 null 로 둔다.""",
         ),
-        ("human", "{text}"),
+        ("human", "[어시스턴트의 직전 질문] {asked}\n[사용자 메시지] {text}"),
     ]
 )
 
@@ -411,6 +438,10 @@ class VisitState(AgentState):
     host: NotRequired[str | None]
     purpose: NotRequired[str | None]
     vehicle_number: NotRequired[str | None]
+    # 날짜·시각을 나눠 말할 때 아직 짝이 없는 쪽을 잠시 들고 있는 값 (짝이 오면 visit_datetime 으로 합치고 비운다)
+    visit_date_part: NotRequired[str | None]
+    visit_time_part: NotRequired[str | None]
+    editing: NotRequired[bool]  # 확인 요약을 보고 수정·질문을 보낸 중이면 True (요약을 다시 보여 줘야 한다)
     status: NotRequired[str]  # submitted / cancelled (확정 대기 여부는 그래프의 interrupt 로 판단한다)
     request_id: NotRequired[str]
     # 5단계 본인 조회: 이 대화에서 처음 확인된 본인과, 마지막으로 보여 준 목록의 전체 신청번호(목록 순서). 화면에는 나가지 않는다.
@@ -418,6 +449,46 @@ class VisitState(AgentState):
     lookup_phone: NotRequired[str]
     lookup_ids: NotRequired[list[str]]
     extracted: NotRequired[list[str]]  # 이번 턴에 새로 추출한 필드 이름 (trace 표시용)
+
+
+def _previous_question(messages: list) -> str:
+    """사용자 메시지 바로 앞의 어시스턴트 발화(AI 답변 또는 return_direct 도구 결과) 문장. 없으면 '없음'.
+
+    도구 호출만 담은 AI 메시지(text 가 빈 문자열)는 건너뛴다. 길면 앞 300자만 쓴다.
+
+    Args:
+        messages: 마지막 사용자 메시지 앞까지의 대화 메시지 목록
+    """
+    for m in reversed(messages):  # reversed: 뒤에서부터 순회 (Java 의 ListIterator 를 끝에서 previous())
+        if isinstance(m, (AIMessage, ToolMessage)) and m.text.strip():
+            return m.text.strip()[:300]
+        if isinstance(m, HumanMessage):  # 그 사이에 어시스턴트 발화가 없으면 직전 질문도 없다
+            break
+    return "없음"
+
+
+def _merge_datetime(state: dict, date_part: str | None, time_part: str | None) -> dict:
+    """나눠 받은 날짜·시각을 이미 가진 값과 합친다. 둘 다 갖춰지면 visit_datetime 을, 아니면 반쪽 값을 state 에 남긴다.
+
+    예: 이전 턴 visit_date_part='2026-11-17' + 이번 턴 '14:00' → visit_datetime='2026-11-17T14:00'.
+        이미 visit_datetime 이 있으면 바꾼 쪽만 갈아 끼운다('시간을 오후 3시로 바꿔 주세요').
+    LLM 이 아니라 코드로 합쳐서, 앞 턴의 날짜를 LLM 이 다시 옮겨 적다 틀리는 일을 막는다.
+
+    Args:
+        state: 현재 그래프 state
+        date_part: 이번 턴에 받은 날짜 YYYY-MM-DD (없으면 None)
+        time_part: 이번 턴에 받은 시각 HH:MM (없으면 None)
+
+    Returns:
+        state 에 합칠 dict
+    """
+    current = state.get("visit_datetime") or ""
+    # 슬라이싱: '2026-11-17T10:00'[:10] = '2026-11-17', [11:16] = '10:00'. A or B 는 A 가 비면 B
+    date_value = date_part or state.get("visit_date_part") or current[:10] or None
+    time_value = time_part or state.get("visit_time_part") or current[11:16] or None
+    if date_value and time_value:
+        return {"visit_datetime": f"{date_value}T{time_value}", "visit_date_part": None, "visit_time_part": None}
+    return {"visit_date_part": date_value, "visit_time_part": time_value}
 
 
 class VisitExtractionMiddleware(AgentMiddleware):
@@ -436,20 +507,40 @@ class VisitExtractionMiddleware(AgentMiddleware):
         self.models = models
 
     def before_agent(self, state, runtime):
-        """마지막 사용자 메시지에서 필드를 추출해 {필드: 값, "extracted": [필드명...]} 을 돌려준다(state 에 합쳐진다)."""
-        human = next(m for m in reversed(state["messages"]) if isinstance(m, HumanMessage))
+        """마지막 사용자 메시지에서 필드를 추출해 {필드: 값, "extracted": [필드명...]} 을 돌려준다(state 에 합쳐진다).
+
+        사용자는 "한빛정밀", "회의", "정민호" 처럼 직전 질문에 짧게 답한다. 메시지 한 줄만 보면 무슨 항목인지 알 수 없으므로
+        어시스턴트의 직전 질문과 이미 모인 항목 이름(값은 넣지 않는다)을 함께 넘긴다.
+        """
+        messages = state["messages"]
+        # 마지막 사용자 메시지의 위치. enumerate 는 (인덱스, 값) 쌍을 준다 (Java 의 for (int i = 0; ...))
+        last = max(i for i, m in enumerate(messages) if isinstance(m, HumanMessage))
         today = reference_date()
-        form = _invoke_with_fallback(
-            EXTRACT_PROMPT,
-            VisitForm,
-            {"text": human.text, "today": today.isoformat(), "weekday": WEEKDAYS[today.weekday()]},
-            self.models,
-        )
+        inputs = {
+            "text": messages[last].text,
+            "asked": _previous_question(messages[:last]),
+            "filled": ", ".join(label for key, label in FIELD_LABELS.items() if state.get(key)) or "없음",
+            "today": today.isoformat(),
+            "weekday": WEEKDAYS[today.weekday()],
+        }
+        form = _invoke_with_fallback(EXTRACT_PROMPT, VisitForm, inputs, self.models)
         # model_dump(exclude_none=True): pydantic 객체 → dict 변환, 값이 None 인 항목은 뺀다 (Jackson 의 NON_NULL)
         found = form.model_dump(exclude_none=True)
+        # dict.pop(키, 기본값): 꺼내면서 지운다 (Java 의 map.remove(key), 없으면 기본값)
+        date_part, time_part = found.pop("visit_date", None), found.pop("visit_time", None)
+        if any(found.get(k) for k in FIELD_LABELS) and state.get("status") in ("submitted", "cancelled"):
+            # 접수·취소로 끝난 대화에서 새 신청 항목이 나오면 새 신청을 시작한 것이다 → 대화 상태를 수집 중으로 되돌린다
+            found["status"] = "collecting"
+        if found.pop("clear_vehicle", None) and "vehicle_number" not in found:
+            found["vehicle_number"] = None  # state 의 차량번호를 지운다 (요약에는 '없음' 으로 나온다)
+        if (date_part or time_part) and "visit_datetime" not in found:
+            found.update(_merge_datetime(state, date_part, time_part))
         remember_name(found.get("visitor_name"))
+        # trace 의 '신청 정보 추출' 에는 신청 필드만 보인다 (부분 날짜·시각은 '방문일시' 로 표시)
+        extracted = [k for k in FIELD_LABELS if k in found or (k == "visit_datetime" and (date_part or time_part))]
+        # (차량번호 삭제도 found 에 vehicle_number=None 으로 들어 있어 '차량번호' 로 표시된다)
         # {**a, "k": v} 는 dict a 를 복사하고 키를 하나 더한 새 dict 다 (Java 로는 new HashMap<>(a) 후 put)
-        return {**found, "extracted": list(found)}
+        return {**found, "extracted": extracted}
 
     def wrap_model_call(self, request, handler):
         """모델을 부를 때마다 시스템 프롬프트 끝에 '신청 진행 상황(모인 항목 / 빠진 필수 항목)' 을 덧붙인다.
@@ -460,17 +551,47 @@ class VisitExtractionMiddleware(AgentMiddleware):
         state = request.state
         have = [label for key, label in FIELD_LABELS.items() if state.get(key)]
         missing = [FIELD_LABELS[key] for key in REQUIRED_FIELDS if not state.get(key)]
-        if state.get("status") == "submitted":
-            note = f"이 대화의 방문 신청은 이미 접수되었다(신청번호 {state.get('request_id')}). 다시 신청하려 하면 create_visit_request 를 호출한다."
+        # 방문일시를 반쪽만 받았으면 나머지 반쪽만 묻게 한다
+        if not state.get("visit_datetime") and state.get("visit_date_part"):
+            missing[missing.index("방문일시")] = "방문일시(날짜는 받음, 시각만 물어본다)"
+        elif not state.get("visit_datetime") and state.get("visit_time_part"):
+            missing[missing.index("방문일시")] = "방문일시(시각은 받음, 날짜만 물어본다)"
+        if state.get("status") == "submitted" and not have:
+            # 접수 직후: 신청 항목은 비어 있다. 새 신청이면 처음부터 받는다(이전 값을 재사용하지 않는다)
+            note = (
+                f"이 대화의 이전 방문 신청은 접수되었다(신청번호 {state.get('request_id')}). "
+                "새 방문 신청이면 필요한 항목을 처음부터 다시 받는다. 이전 신청 값을 재사용하지 않는다."
+            )
+        elif not missing and state.get("editing"):
+            # 확인 요약을 보던 사용자가 수정·질문을 보낸 턴: 저장 없이 요약을 다시 보여 줘야 한다
+            note = (
+                "사용자가 확인 요약을 보고 수정 또는 질문을 보냈다. 수정 내용은 이미 신청 항목에 반영되어 있다. "
+                "질문이면 먼저 짧게 답하고, 수정이든 질문이든 마지막에는 create_visit_request 를 다시 호출해 바뀐 요약을 보여 준다. "
+                "피방문자가 바뀌었으면 find_host 로 먼저 확인한다. 직접 저장했다거나 접수됐다고 말하지 않는다."
+            )
         elif not missing:
             note = "필수 항목이 모두 모였다. 차량번호 같은 선택 항목은 묻지 말고 바로 find_host 와 create_visit_request 를 호출한다."
         elif have:
-            note = f"모인 항목: {', '.join(have)}. 빠진 필수 항목: {', '.join(missing)}. 빠진 항목만 짧게 물어본다."
+            # 대화에서 들었어도 추출되지 않은 값은 state 에 없다 → 받았다고 말하지 말고 다시 묻게 한다(도구는 state 만 읽는다)
+            note = (
+                f"모인 항목: {', '.join(have)}. 빠진 필수 항목: {', '.join(missing)}. 빠진 항목만 짧게 물어본다. "
+                "모인 항목에 없는 값은 대화에서 들었더라도 아직 확보되지 않은 것이니 받았다고 말하지 말고 다시 묻는다. "
+                "빠진 필수 항목이 있는 동안에는 create_visit_request 를 호출하지 않는다."
+            )
         else:
             note = "아직 모인 신청 항목이 없다. 방문 신청 요청이면 필요한 항목을 안내한다."
         if state.get("lookup_name"):
             # 본인 확인이 끝난 대화: 이름·번호 값은 넣지 않고 사실만 알린다(인자 없이 조회·상세·취소를 이어 가게)
             note += f"\n[본인 조회] 이 대화의 본인은 이미 확인되었다. 마지막 목록은 {len(state.get('lookup_ids') or [])}건이다."
+        # LLM 은 입력 예시에 지난 날짜(예: 2025-07-10)를 들곤 한다. 기준일 다음 첫 평일을 예시 날짜로만 알려 준다.
+        # 오늘 날짜 자체는 알려 주지 않는다: 알려 주면 LLM 이 과거·주말 날짜를 직접 판단해(요일까지 틀리며) 도구 검증을 건너뛴다.
+        sample = reference_date() + timedelta(days=1)
+        while sample.weekday() >= 5:  # 토·일이면 다음 평일로 미룬다
+            sample += timedelta(days=1)
+        note += (
+            f"\n[입력 예시] 방문일시를 물을 때 예시는 '{sample.month}월 {sample.day}일 오후 2시' 를 쓴다. "
+            "날짜가 지났는지·당일인지·주말인지는 직접 판단하지 말고 create_visit_request 의 검증에 맡긴다."
+        )
         # request.override(...) 는 일부 값만 바꾼 요청 복사본을 만든다 (Java record 의 withXxx() 와 같은 불변 갱신)
         return handler(request.override(system_message=SystemMessage(f"{request.system_prompt}\n\n[신청 진행 상황] {note}")))
 
@@ -636,20 +757,20 @@ def _collect_contexts(turn: list) -> list[dict[str, str]]:
     return contexts
 
 
-def _confirmation_text(payload: dict) -> str:
+def _confirmation_text(payload: dict, lead: str = "") -> str:
     """확정 대기(interrupt) 때 화면에 보낼 안내문과 신청 요약을 만든다. 값은 이 함수를 부른 쪽에서 마스킹한다.
 
     형식: 첫 줄은 안내문, 다음 줄부터 "항목: 값" (화면 JS 가 이 줄들을 신청서 카드로 그린다).
 
     Args:
-        payload: create_visit_request 가 interrupt 에 넘긴 값 {"fields": 신청 필드, "retry": 다시 묻는 중인지}
+        payload: create_visit_request 가 interrupt 에 넘긴 값 {"fields": 신청 필드}
+        lead: 요약 앞에 붙일 LLM 답변 (수정 턴에 질문에 답한 경우). 없으면 빈 문자열
     """
     fields = payload["fields"]
-    head = (
-        "'확정' 또는 '취소' 로만 답해 주세요. 확정 전에는 저장되지 않습니다."
-        if payload.get("retry")
-        else "아래 내용으로 방문을 신청할까요? '확정' 또는 '취소' 로 답해 주세요. 확정 전에는 저장되지 않습니다."
-    )
+    head = "아래 내용으로 방문을 신청할까요? '확정' 또는 '취소' 로 답하거나, 바꿀 내용을 입력해 주세요. 확정 전에는 저장되지 않습니다."
+    if lead:
+        # 수정 턴에 LLM 이 한 말(질문 답변 등)을 안내문 앞에 붙인다. 화면이 첫 줄을 안내문으로 쓰므로 한 줄로 편다.
+        head = " ".join(lead.split()) + " " + head
     lines = [head]
     # dict.items() 는 (키, 값) 쌍을 차례로 준다 (Java 의 map.entrySet())
     for key, label in FIELD_LABELS.items():
@@ -663,7 +784,9 @@ def _confirmation_text(payload: dict) -> str:
 def answer(question: str, thread_id: str) -> dict:
     """사용자 질문 한 턴을 실행해 answer, contexts, trace, status 를 dict 로 돌려준다.
 
-    - 확정 대기(interrupt) 중인 대화면, 이번 입력을 '확정 대기 답' 으로 보고 그래프를 재개한다(Command(resume=입력)).
+    - 확정 대기(interrupt) 중에 '확정'·'취소' 가 오면 그 답으로 그래프를 재개한다(Command(resume=입력)).
+    - 확정 대기 중에 그 밖의 입력(수정·차량번호 추가·질문)이 오면, 저장 없이 확인 단계를 닫고 같은 입력을 새 사용자 메시지로
+      넣어 일반 턴을 실행한다. 가드레일·추출을 거쳐 바뀐 값으로 요약을 다시 보여 준다.
     - 아니면 입력을 새 사용자 메시지로 넣어 한 턴을 실행한다.
     Bedrock 오류(타임아웃, 모든 모델 한도 초과 등)는 여기서 잡지 않고 그대로 올려 API 가 503 으로 바꾼다.
 
@@ -689,10 +812,15 @@ def answer(question: str, thread_id: str) -> dict:
             "status": "submitted",
         }
 
-    resumed = bool(snapshot.interrupts)
+    # in 연산자: 튜플 안에 값이 있는지 (Java 의 Set.of(...).contains(...))
+    resumed = bool(snapshot.interrupts) and normalize_reply(question) in ("확정", "취소")
+    editing = bool(snapshot.interrupts) and not resumed
     if resumed:
         result = graph.invoke(Command(resume=question), config)
     else:
+        if editing:
+            # 확인 단계를 닫는다. 도구는 저장하지 않고 editing=True 와 ToolMessage 만 남긴 채 끝난다.
+            graph.invoke(Command(resume=question), config)
         result = graph.invoke({"messages": [HumanMessage(question)]}, config)
 
     after = graph.get_state(config)
@@ -703,8 +831,12 @@ def answer(question: str, thread_id: str) -> dict:
         names.append(values["lookup_name"])
 
     if after.interrupts:
-        # 확정 대기: create_visit_request 가 interrupt 에 넘긴 요약을 보여 준다
-        answer_text = _confirmation_text(after.interrupts[0].value)
+        # 확정 대기: create_visit_request 가 interrupt 에 넘긴 요약을 보여 준다.
+        # 수정 턴이면 LLM 의 마지막 말(질문 답변, '차량번호를 추가했습니다' 등)을 안내문 앞에 붙인다.
+        # 첫 신청 턴의 진행 멘트('피방문자 확인을 먼저 진행하겠습니다')는 붙이지 않는다.
+        said = [m.text for m in _turn_messages(result["messages"]) if isinstance(m, AIMessage) and m.text.strip()]
+        lead = said[-1] if editing and said else ""  # said[-1] 은 마지막 원소 (Java 의 list.get(list.size() - 1))
+        answer_text = _confirmation_text(after.interrupts[0].value, lead)
         status = "pending_confirmation"
     else:
         final = result["messages"][-1]  # 마지막 메시지가 이번 턴의 답 (AI 답변 또는 return_direct 도구 결과)
@@ -718,7 +850,7 @@ def answer(question: str, thread_id: str) -> dict:
 
     if resumed:
         # 재개된 턴은 새 메시지가 아니라 확정 대기 답이므로 trace 를 따로 만든다
-        outcome = {"pending_confirmation": "확정/취소 재질문", "submitted": "확정 → 저장 완료", "cancelled": "취소 → 저장 안 함"}
+        outcome = {"submitted": "확정 → 저장 완료", "cancelled": "취소 → 저장 안 함"}
         trace = [{"step": "확정 대기 응답", "input": question, "output": outcome.get(status, status)}]
         contexts = []
     else:
@@ -741,6 +873,9 @@ def answer(question: str, thread_id: str) -> dict:
             extract_step = {"step": "신청 정보 추출", "input": "사용자 입력", "output": ", ".join(labels) or "해당 없음"}
             # 리스트 + 리스트 는 두 리스트를 이어 붙인 새 리스트 (Java 의 addAll)
             trace = [guard_step, extract_step] + _build_trace(turn)
+        if editing:
+            # 확인 단계를 닫은 일을 맨 앞에 기록한다
+            trace.insert(0, {"step": "확정 대기 응답", "input": question, "output": "수정·질문 → 저장 없이 확인 단계 다시 시작"})
         contexts = _collect_contexts(turn)
 
     return {

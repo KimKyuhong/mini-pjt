@@ -187,9 +187,21 @@
       dl.append(el("dt", null, row.slice(0, i)), el("dd", null, row.slice(i + 2)));
     }
     card.append(dl);
+    // 수정 버튼은 바로 보내지 않고 입력창에 예시 문장을 채운다. 사용자가 고쳐서 보내면 서버가 추출해 요약을 다시 보여 준다.
+    const edit = el("div", "pass__edit");
+    const fills = [["수정", "방문일시를 11월 18일 오후 2시로 바꿔 주세요"]];
+    if (/^차량번호: 없음$/m.test(data.answer)) fills.push(["차량번호 추가", "차량번호 "]);
+    for (const [label, text] of fills) {
+      const b = el("button", "btn btn--ghost", label);
+      b.type = "button";
+      b.dataset.fill = text;
+      b.dataset.passAction = "";
+      edit.append(b);
+    }
+    card.append(edit);
     const strip = el("div", "strip strip--open");
     const note = el("p");
-    note.append(el("strong", null, "확정 대기"), document.createTextNode("신청번호는 확정 후 발급됩니다"));
+    note.append(el("strong", null, "확정 대기"), document.createTextNode("바꿀 내용은 입력해 주세요 · 신청번호는 확정 후 발급됩니다"));
     const actions = el("div", "strip__actions");
     for (const [label, cls] of [["취소", "btn btn--ghost"], ["확정", "btn btn--primary"]]) {
       const b = el("button", cls, label);
@@ -369,6 +381,14 @@
   document.addEventListener("click", e => {
     if (e.target.closest("#unknown-thread")) { ask("모르는 thread_id 테스트", "unknown-thread-id"); return; }
     if (e.target.closest("#double-confirm")) { doubleConfirm(); return; }
+    const fill = e.target.closest("[data-fill]");
+    if (fill && !fill.disabled) {
+      // 입력창에 예시를 채우고 커서를 끝으로 옮긴다 (전송은 사용자가 고친 뒤 직접 한다)
+      input.value = fill.dataset.fill;
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+      return;
+    }
     const b = e.target.closest("[data-ask]");
     if (!b || b.disabled) return;
     // 신청서 카드의 확정/취소는 누르는 즉시 비활성화한다(응답 전 두 번 누르기 방지)
