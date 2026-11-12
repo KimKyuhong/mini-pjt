@@ -3,4 +3,5 @@
 .env
 __pycache__/
 docs/
-data/runtime/.ouroboros/artifacts/
+data/runtime/
+.ouroboros/artifacts/
