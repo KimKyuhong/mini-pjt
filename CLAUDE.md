@@ -15,7 +15,7 @@
 ## 기술 스택
 - Python, LangChain, LangGraph, FastAPI
 - 모델은 Amazon Bedrock (ChatBedrockConverse, 리전 us-east-1), 모델 ID 는 코드 상수로 고정한다
-  - 에이전트: global.anthropic.claude-sonnet-4-6
+  - 에이전트: us.anthropic.claude-sonnet-4-6 → global.anthropic.claude-sonnet-4-6 → us.anthropic.claude-haiku-4-5-20251001-v1:0 → global.anthropic.claude-haiku-4-5-20251001-v1:0 순서. 앞 모델이 사용량 한도(ThrottlingException)일 때만 다음 모델로 넘어간다(미들웨어). 타임아웃 등 다른 오류는 503
   - 평가(LLM-as-Judge·RAGAS): global.anthropic.claude-haiku-4-5-20251001-v1:0
   - 임베딩: amazon.titan-embed-text-v2:0
   - Claude 5 계열은 현재 키에 권한이 없어 쓰지 않는다
@@ -26,8 +26,10 @@
 
 ## 폴더 구조 (제출 규약. 바꾸지 않는다)
 src/agent.py       메인 에이전트 그래프, 미들웨어(가드레일·마스킹), HITL
-src/tools.py       도메인 도구 4개 (search_regulations, find_host, create_visit_request, get_my_requests)
+src/tools.py       도메인 도구 6개 (search_regulations, find_host, create_visit_request, get_my_requests, get_request_detail, cancel_my_request)
 src/retriever.py   RAG 파이프라인 (FAISS)
+src/api.py         FastAPI 앱 (POST /query, web/ 정적 제공)
+web/               에이전트 테스트용 웹 화면 (index.html, app.css, tokens.css, base.css, 사진)
 data/              가상 규정 문서, 더미 임직원 JSON, 시드 신청 JSON
 evaluation/        test_queries.csv 와 평가 리포트 (roundN_report.md, roundN_summary.json)
 tests/             단위 테스트 (test_retriever, test_api, test_visit_flow, test_tools, test_guardrails)
@@ -45,8 +47,12 @@ tests/             단위 테스트 (test_retriever, test_api, test_visit_flow, 
 - 검증: 과거·당일 신청 불가(최소 1일 전), 주말 불가, 휴대폰번호 형식, 없는 피방문자 거부
 - 날짜 기준일은 KST 오늘. 환경변수 VISIT_REFERENCE_DATE(YYYY-MM-DD)로만 바꿀 수 있고 API 로는 받지 않는다
 - 저장 직전 interrupt() 로 마스킹된 요약을 보여주고 '확정' 일 때만 저장한다. 그 밖의 입력은 확정/취소를 다시 묻는다
-- 이미 submitted 인 신청에 '확정' 이 다시 오면 같은 신청번호를 다시 안내하고 저장하지 않는다
-- 본인 조회는 이름+휴대폰번호+신청번호가 모두 맞을 때만. 불일치는 존재 여부를 드러내지 않는 같은 문구로 답한다
+- 이미 submitted 인 신청에 '확정' 이 다시 오면 같은 신청번호를 다시 안내하고 저장하지 않는다. 이 판별은 LLM 호출 전 state 검사로 한다
+- 중복 저장 방지: 같은 thread_id 의 /query 는 thread_id 별 잠금으로 직렬화하고(uvicorn 단일 워커), 확정 턴은 저장을 마지막 단계로 둬 저장 뒤 LLM 을 부르지 않는다(Command goto=END). 저장소 쓰기는 프로세스 잠금 안에서 일련번호로 발급한다. 확정과 취소의 동시 도착은 범위 밖
+- 본인 신청 목록·상세는 이름+휴대폰번호가 함께 맞을 때만 보여 준다(지난 방문·취소 건 포함, 방문일 순, 신청번호는 일부만 표시). 불일치·0건은 존재 여부를 드러내지 않는 같은 문구로 답한다
+- 한 대화에서는 처음 확인된 본인만 조회한다. 다른 이름·휴대폰번호로 조회하려 하면 새 대화로 안내한다
+- 신청 취소는 방문일이 기준일(KST 오늘)보다 뒤인 접수 건만, 전체 신청번호까지 맞을 때 확인 단계 없이 즉시 처리한다. 삭제하지 않고 status=cancelled·cancelled_at 으로 남기며, 시드 신청은 파일을 바꾸지 않고 런타임 저장소 기록이 우선한다
+- 조회·거절 응답은 대화 status 를 바꾸지 않고, 취소 성공 응답만 cancelled 로 돌려준다
 
 ## 보안·개인정보
 - 원본 개인정보는 신청 저장소 JSON 에만 둔다. 응답, trace, 로그, LangSmith, 평가 리포트에서는 마스킹한다
@@ -56,6 +62,10 @@ tests/             단위 테스트 (test_retriever, test_api, test_visit_flow, 
 ## 코드 규칙
 - 파일 하나에 한 가지 역할만 둔다
 - 함수와 도구에는 한국어 docstring 을 쓴다
+- 사용자는 Java 개발자이고 파이썬 문법에 익숙하지 않다. 모든 파이썬 코드(src, tests, evaluation)에 친절한 주석을 단다
+  - 파일 맨 위 docstring 에 이 파일의 역할과 흐름을 Java 개념에 빗대어 설명한다 (예: FastAPI 라우트 = @PostMapping, 픽스처 = @BeforeEach)
+  - 파이썬 특유 문법(컴프리헨션, 슬라이싱, 언패킹, **kwargs, with, yield, 데코레이터, global 등)이 처음 나오는 곳에 Java 대응 표현을 주석으로 단다
+  - 함수 docstring 에 Args/Returns 와 "왜 이렇게 했는지"를 적는다. 동작 변경 없이 주석만 고칠 때도 테스트를 다시 돌려 확인한다
 - 비밀 값은 .env 에서 읽고 코드에 적지 않는다. 새 환경변수는 .env.example 에 추가한다
 - 테스트는 신청 저장소를 임시 경로로 바꿔 작업 폴더 파일을 건드리지 않는다
 
@@ -66,5 +76,5 @@ tests/             단위 테스트 (test_retriever, test_api, test_visit_flow, 
 ## 하지 말 것
 - 요청하지 않은 파일을 새로 만들지 않는다
 - 기존 파일을 통째로 다시 쓰지 않는다. 바뀐 부분만 고친다
-- 범위에서 제외한 기능(신청 취소·수정, 차량 출입 등록, 반입 물품 신고, 단체 방문, SMS/메일 발송, 피방문자 승인)을 만들지 않는다
+- 범위에서 제외한 기능(신청 수정, 차량 출입 등록, 반입 물품 신고, 단체 방문, SMS/메일 발송, 피방문자 승인)을 만들지 않는다
 - 폴더 구조와 /query 형식을 임의로 바꾸지 않는다
