@@ -10,6 +10,9 @@
 
 # ── 표준 라이브러리 import ─────────────────────────────────────────
 # Python 의 import 는 Java 의 import 와 같지만, 모듈(파일) 단위로 가져온다.
+import base64  # Basic 인증 헤더 해독 (java.util.Base64)
+import os  # 환경변수 읽기 (System.getenv)
+import secrets  # 비밀번호 비교 (시간 차이로 값을 추측하지 못하게 비교)
 import threading  # 스레드 잠금 (java.util.concurrent.locks 와 비슷)
 import uuid  # UUID 생성 (java.util.UUID)
 from pathlib import Path  # 파일 경로 객체 (java.nio.file.Path)
@@ -24,7 +27,7 @@ load_dotenv()
 
 # noqa: E402 는 "import 가 파일 맨 위에 있지 않다"는 린터 경고를 끄는 표시다. 위 load_dotenv() 때문에 일부러 아래에 둔다.
 from botocore.exceptions import BotoCoreError, ClientError  # noqa: E402  AWS SDK 예외 클래스
-from fastapi import FastAPI, HTTPException  # noqa: E402
+from fastapi import FastAPI, HTTPException, Request, Response  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402  정적 파일(html, css, 이미지) 제공
 from pydantic import BaseModel, Field  # noqa: E402  DTO 정의와 값 검증
 
@@ -79,6 +82,51 @@ class QueryResponse(BaseModel):
 
 # FastAPI 애플리케이션 객체. Spring 의 ApplicationContext 처럼 라우트(URL)를 모아 두는 곳이다.
 app = FastAPI(title="사업장 방문 신청 어시스턴트")
+
+
+# @app.middleware("http"): 모든 HTTP 요청이 라우트에 닿기 전에 거치는 필터를 등록한다 (Spring 의 OncePerRequestFilter).
+# async def / await 는 비동기 함수 문법이다. call_next(request) 는 Java 필터의 chain.doFilter(request, response) 에 해당한다.
+@app.middleware("http")
+async def require_password(request: Request, call_next):
+    """환경변수 ACCESS_PASSWORD 가 있으면 화면과 /query 모두 접속 비밀번호(HTTP Basic 인증)를 요구한다.
+
+    Args:
+        request: 들어온 HTTP 요청
+        call_next: 다음 단계(실제 라우트)를 실행하는 함수
+    Returns:
+        비밀번호가 맞거나 설정이 없으면 원래 응답, 틀리면 401 응답
+
+    왜 이렇게 했는지:
+    - 공개 URL 로 배포하면 누구나 Bedrock 을 호출해 요금이 나온다. 가장 단순한 방어로 비밀번호 하나를 둔다.
+    - Basic 인증은 브라우저가 로그인 창을 띄우고, 이후 같은 사이트의 fetch(/query) 에도 자동으로 붙여 보낸다.
+      그래서 web/ 화면과 /query 요청·응답 형식을 바꾸지 않아도 된다. 사용자 이름은 아무 값이나 받는다.
+    - 값이 없으면(로컬 개발·테스트) 검사를 건너뛴다. 요청마다 읽으므로 테스트에서 환경변수를 바꿔 확인할 수 있다.
+    """
+    password = os.getenv("ACCESS_PASSWORD")
+    if password:
+        credentials = _basic_password(request.headers.get("authorization", ""))
+        # compare_digest: 걸리는 시간으로 비밀번호를 추측하지 못하게 하는 비교 (Java 의 MessageDigest.isEqual)
+        if credentials is None or not secrets.compare_digest(credentials.encode(), password.encode()):
+            return Response(
+                "접속 비밀번호가 필요합니다.",
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="visit-assistant", charset="UTF-8"'},
+                media_type="text/plain; charset=utf-8",
+            )
+    return await call_next(request)
+
+
+def _basic_password(header: str) -> str | None:
+    """'Basic base64(이름:비밀번호)' 헤더에서 비밀번호만 꺼낸다. 형식이 틀리면 None."""
+    scheme, _, encoded = header.partition(" ")  # partition: 첫 공백 기준으로 (앞, 공백, 뒤) 3개로 나눈다
+    if scheme.lower() != "basic":
+        return None
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):  # base64 나 UTF-8 이 깨진 헤더
+        return None
+    _, sep, pw = decoded.partition(":")
+    return pw if sep else None
 
 # 서버가 발급한 thread_id 목록 (Java 의 Set<String>).
 # 메모리에만 있으므로 서버를 재시작하면 사라진다. 대화 상태를 담는 MemorySaver 와 수명이 같다.

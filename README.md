@@ -70,6 +70,20 @@ cp .env.example .env
 - 날짜 검증 기준일은 KST 오늘입니다. 재현이 필요하면 `.env` 의 `VISIT_REFERENCE_DATE=2026-11-12` 로 고정합니다(API 로는 바꿀 수 없음).
 - Bedrock 호출은 타임아웃 30초·재시도 없음이고, 실패하면 503 을 돌려주며 저장하지 않습니다.
 
+## 외부 배포 (Render)
+
+[render.yaml](render.yaml) 로 Render 웹 서비스 1개를 만듭니다.
+
+1. 이 저장소를 GitHub 에 올린 뒤 Render 대시보드에서 **New > Blueprint** 를 누르고 저장소를 고릅니다.
+2. 처음 만들 때 비밀 값을 입력합니다: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `ACCESS_PASSWORD`, (선택) `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`.
+   AWS 키는 Bedrock 호출 권한만 준 IAM 사용자 키를 따로 만들어 쓰고, AWS 예산 알림을 걸어 둡니다.
+3. 배포가 끝나면 `https://<서비스 이름>.onrender.com` 에 접속합니다. 브라우저 로그인 창에 사용자 이름은 아무 값, 비밀번호는 `ACCESS_PASSWORD` 를 넣습니다.
+
+- `ACCESS_PASSWORD` 가 있으면 화면과 `/query` 모두 HTTP Basic 인증을 요구합니다(없으면 401). `/query` 요청·응답 형식은 같습니다.
+- 무료 플랜은 15분 동안 요청이 없으면 잠들고, 다시 깨어날 때 1분 정도 걸립니다. 시작할 때 규정 문서 인덱스를 다시 만듭니다.
+- 디스크가 영구 저장소가 아니라서, 재배포나 재시작 때 새로 접수된 신청(`data/runtime/`)과 대화가 사라집니다. 시드 신청은 남습니다.
+- 공개 화면에는 실제 이름·연락처를 입력하지 않도록 안내합니다.
+
 ## API
 
 ```http

@@ -94,3 +94,39 @@ def test_화면을_루트에서_제공한다():
     res = client.get("/")
     assert res.status_code == 200
     assert "방문 신청 어시스턴트" in res.text
+
+
+def _basic(password: str) -> dict:
+    """Basic 인증 헤더를 만든다. 사용자 이름은 아무 값이나 된다."""
+    import base64  # 이 헬퍼에서만 쓰는 import (Java 와 달리 함수 안에서도 import 할 수 있다)
+
+    token = base64.b64encode(f"guest:{password}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+def test_접속_비밀번호가_설정되면_없거나_틀린_요청은_401(monkeypatch):
+    """ACCESS_PASSWORD 가 있으면 화면과 /query 모두 비밀번호 없이는 401 이고, 브라우저 로그인 창을 띄우는 헤더를 준다."""
+    # monkeypatch.setenv: 이 테스트 동안만 환경변수를 바꾸고 끝나면 되돌린다
+    monkeypatch.setenv("ACCESS_PASSWORD", "demo-pass")
+    for res in (
+        client.post("/query", json={"question": "안녕하세요"}),
+        client.post("/query", json={"question": "안녕하세요"}, headers=_basic("wrong")),
+        client.get("/"),
+    ):
+        assert res.status_code == 401
+        assert res.headers["WWW-Authenticate"].startswith("Basic")
+
+
+def test_접속_비밀번호가_맞으면_그대로_응답한다(monkeypatch):
+    """비밀번호가 맞으면 /query 형식은 그대로다."""
+    monkeypatch.setenv("ACCESS_PASSWORD", "demo-pass")
+    res = client.post("/query", json={"question": "안녕하세요"}, headers=_basic("demo-pass"))
+    assert res.status_code == 200
+    assert set(res.json()) == {"answer", "contexts", "trace", "thread_id", "status"}
+    assert client.get("/", headers=_basic("demo-pass")).status_code == 200
+
+
+def test_접속_비밀번호가_없으면_검사하지_않는다(monkeypatch):
+    """로컬 개발처럼 ACCESS_PASSWORD 가 비어 있으면 인증 없이 동작한다."""
+    monkeypatch.delenv("ACCESS_PASSWORD", raising=False)
+    assert client.post("/query", json={"question": "안녕하세요"}).status_code == 200
